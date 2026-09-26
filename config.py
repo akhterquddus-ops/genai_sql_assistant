@@ -123,6 +123,7 @@ def _get_float(name: str, default: float) -> float:
 class OllamaSettings:
     url: str             # where the Ollama server listens
     model: str           # e.g. qwen2.5-coder:3b
+    rewrite_model: str   # model for follow-up rewriting (defaults to `model`)
     timeout: int         # seconds to wait for one answer
     temperature: float   # 0 = most predictable output (best for SQL)
     context_size: int    # tokens the model can "see" at once (prompt + answer)
@@ -143,9 +144,11 @@ def load_ollama_settings() -> OllamaSettings:
     if not 0.0 <= temperature <= 2.0:
         raise ConfigError("OLLAMA_TEMPERATURE must be between 0 and 2.")
 
+    model = _get("OLLAMA_MODEL", "qwen2.5-coder:3b")
     return OllamaSettings(
         url=url,
-        model=_get("OLLAMA_MODEL", "qwen2.5-coder:3b"),
+        model=model,
+        rewrite_model=_get("OLLAMA_REWRITE_MODEL", "") or model,
         timeout=_get_int("OLLAMA_TIMEOUT", 180),
         temperature=temperature,
         context_size=_get_int("OLLAMA_CONTEXT_SIZE", 4096),

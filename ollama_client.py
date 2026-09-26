@@ -113,7 +113,7 @@ def get_status(settings: OllamaSettings | None = None) -> OllamaStatus:
 
 def _build_payload(settings: OllamaSettings, messages: list[dict], system: str | None,
                    temperature: float | None, response_format: dict | str | None,
-                   max_tokens: int | None, stream: bool) -> dict:
+                   max_tokens: int | None, stream: bool, model: str | None = None) -> dict:
     if system:
         messages = [{"role": "system", "content": system}, *messages]
     options = {
@@ -123,7 +123,7 @@ def _build_payload(settings: OllamaSettings, messages: list[dict], system: str |
     if max_tokens:
         options["num_predict"] = max_tokens      # hard cap on answer length
     payload = {
-        "model": settings.model,
+        "model": model or settings.model,
         "messages": messages,
         "stream": stream,
         "keep_alive": "10m",      # keep the model in memory between questions
@@ -135,6 +135,7 @@ def _build_payload(settings: OllamaSettings, messages: list[dict], system: str |
 
 
 def _post(settings: OllamaSettings, payload: dict, stream: bool) -> requests.Response:
+    model = payload["model"]
     try:
         response = requests.post(f"{settings.url}/api/chat", json=payload,
                                  timeout=settings.timeout, stream=stream)
@@ -149,8 +150,8 @@ def _post(settings: OllamaSettings, payload: dict, stream: bool) -> requests.Res
             "OLLAMA_TIMEOUT, or use a smaller model."
         ) from exc
     if response.status_code == 404:
-        raise OllamaError(f"Model '{settings.model}' is not downloaded. "
-                          f"Run: ollama pull {settings.model}")
+        raise OllamaError(f"Model '{model}' is not downloaded. "
+                          f"Run: ollama pull {model}")
     if not response.ok:
         raise OllamaError(f"Ollama returned an error ({response.status_code}): "
                           f"{response.text[:200]}")
@@ -161,6 +162,7 @@ def chat(messages: list[dict], system: str | None = None,
          temperature: float | None = None,
          response_format: dict | str | None = None,
          max_tokens: int | None = None,
+         model: str | None = None,
          settings: OllamaSettings | None = None) -> ChatResult:
     """Send a conversation to the local model and return its whole reply.
 
@@ -170,16 +172,17 @@ def chat(messages: list[dict], system: str | None = None,
                      answer into that shape ("structured output"), so our
                      code can read it reliably.
     max_tokens:      optional cap on the length of the answer
+    model:           use a different installed model for this one call
     """
     settings = settings or get_ollama_settings()
     payload = _build_payload(settings, messages, system, temperature,
-                             response_format, max_tokens, stream=False)
+                             response_format, max_tokens, stream=False, model=model)
     start = time.perf_counter()
     data = _post(settings, payload, stream=False).json()
     elapsed = time.perf_counter() - start
     result = ChatResult(
         content=data.get("message", {}).get("content", "").strip(),
-        model=data.get("model", settings.model),
+        model=data.get("model", payload["model"]),
         elapsed_seconds=elapsed,
         load_seconds=data.get("load_duration", 0) / 1e9,     # Ollama reports nanoseconds
         prompt_tokens=data.get("prompt_eval_count", 0),

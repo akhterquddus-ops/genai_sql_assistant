@@ -154,3 +154,88 @@ def build_explanation_system_prompt(currency_symbol: str, currency_name: str) ->
 
 def build_explanation_message(question: str, facts: str) -> str:
     return f"USER'S QUESTION: {question}\n\n{facts}\n\nExplain these results."
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: follow-up questions ("query rewriting")
+# ---------------------------------------------------------------------------
+# A follow-up such as "What about February?" only makes sense together with
+# the previous question. Instead of sending the whole conversation to the SQL
+# model (longer, slower prompt that small models handle badly), a short
+# separate call rewrites the follow-up into a STANDALONE question. The normal,
+# already-tested Text-to-SQL pipeline then runs on that question.
+
+# The model must FIRST choose the type of follow-up, THEN write the question.
+# JSON fields are generated in order, so the decision comes before the text.
+# (Testing showed qwen2.5-coder:3b tends to COMBINE questions when it should
+# REPLACE part of them; committing to a type first is meant to counter that.)
+FOLLOW_UP_TYPES = ["new_topic", "replace", "narrow", "combine", "answer"]
+
+REWRITE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "follow_up_type": {"type": "string", "enum": FOLLOW_UP_TYPES},
+        "standalone_question": {"type": "string"},
+    },
+    "required": ["follow_up_type", "standalone_question"],
+}
+
+REWRITE_SYSTEM_PROMPT = """\
+You rewrite the user's NEW MESSAGE into one complete, standalone question about
+a business database, using the conversation so far.
+
+STEP 1 - choose the follow_up_type:
+- "new_topic": the new message is complete on its own. Return it UNCHANGED.
+- "replace":   "What about X?", "And X?", "How about X?". Take the PREVIOUS
+               question and SWAP the matching part for X. The old value
+               DISAPPEARS. (January -> February, top -> bottom, Sales -> Finance)
+- "narrow":    "only those...", "which of them...". The previous question plus a
+               filter, written as ONE question about the filtered items.
+- "combine":   ONLY when the user says "also", "as well", "both" or "compare".
+- "answer":    the user answers the assistant's clarifying question.
+
+STEP 2 - write the standalone_question:
+- Exactly ONE question. Never two questions joined with "and".
+- Replace words like "them", "those", "it" with what they mean.
+- Keep every detail the user gave. Do not add details they did not give.
+- Do NOT answer the question. Do NOT write SQL.
+
+Reply with ONLY a JSON object:
+{"follow_up_type": "...", "standalone_question": "..."}
+
+EXAMPLES
+Conversation:
+User: How many orders were placed in January?
+NEW MESSAGE: What about February?
+{"follow_up_type": "replace", "standalone_question": "How many orders were placed in February?"}
+
+Conversation:
+User: How many customers live in Islamabad?
+NEW MESSAGE: And in Lahore?
+{"follow_up_type": "replace", "standalone_question": "How many customers live in Lahore?"}
+
+Conversation:
+User: Show all customers from Islamabad.
+NEW MESSAGE: Also Lahore.
+{"follow_up_type": "combine", "standalone_question": "Show all customers from Islamabad and Lahore."}
+
+Conversation:
+User: Show the products in the Books category.
+NEW MESSAGE: Which of them has the highest price?
+{"follow_up_type": "narrow", "standalone_question": "Which product in the Books category has the highest price?"}
+
+Conversation:
+User: Show me the numbers.
+Assistant asked: Which numbers would you like to see: sales, orders, products or employees?
+NEW MESSAGE: employees per department
+{"follow_up_type": "answer", "standalone_question": "Show the number of employees per department."}
+
+Conversation:
+User: Show the 10 most expensive products.
+NEW MESSAGE: What is the average employee salary?
+{"follow_up_type": "new_topic", "standalone_question": "What is the average employee salary?"}
+"""
+
+
+def build_rewrite_message(history_text: str, question: str) -> str:
+    return f"Conversation:\n{history_text}\nNEW MESSAGE: {question}"

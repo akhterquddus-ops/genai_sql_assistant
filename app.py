@@ -3,8 +3,9 @@ app.py - GenAI SQL Assistant (Streamlit web interface)
 
 Start with:   streamlit run app.py
 
-Pipeline (Phase 7):
-    question -> local LLM writes SQL -> SQL validator -> read-only login
+Pipeline (Phase 8):
+    question -> (follow-up? rewrite into a standalone question)
+             -> local LLM writes SQL -> SQL validator -> read-only login
              -> SQL Server -> results -> local LLM explains the results
 
 Phase history:
@@ -12,7 +13,8 @@ Phase history:
   Phase 4  Ollama status in the sidebar
   Phase 5  the local LLM generates the SQL
   Phase 6  SQL validator checks every query before it runs
-  Phase 7  the local LLM explains the results               <- this version
+  Phase 7  the local LLM explains the results
+  Phase 8  conversation memory for follow-up questions      <- this version
 """
 
 import time
@@ -20,6 +22,7 @@ import time
 import streamlit as st
 
 import schema
+from conversation import MAX_HISTORY_TURNS, add_turn, make_turn, rewrite_question
 from config import ConfigError, get_ollama_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
 from ollama_client import OllamaError
@@ -68,23 +71,41 @@ def get_llm_status() -> dict:
 # ---------------------------------------------------------------------------
 
 def run_pipeline(question: str | None, sql: str | None = None) -> None:
-    outcome = {"question": question, "sql": sql, "generation": None, "validation": None,
+    outcome = {"asked": question, "question": question, "rewrite": None,
+               "sql": sql, "generation": None, "validation": None,
                "notice": None, "result": None, "error": None, "error_stage": None}
     st.session_state.outcome = outcome
 
-    # Step 1: question -> SQL with the local LLM (skipped for hand-typed SQL)
-    if sql is None:
-        try:
-            generation = generate_sql(question)
-        except SQLGenerationError as exc:
-            outcome["error"], outcome["error_stage"] = str(exc), "SQL generation"
-            return
-        outcome["generation"] = vars(generation)
-        if generation.status != "ok":            # clarify / unanswerable
-            outcome["notice"] = (generation.status, generation.message)
-            return
-        outcome["sql"] = generation.sql
+    if sql is not None:                  # hand-typed SQL: not part of the conversation
+        _check_and_run(outcome)
+        return
 
+    # Step 0: follow-up? Rewrite it into a standalone question (Phase 8).
+    history = st.session_state.get("history", [])
+    if st.session_state.get("use_memory", True) and history:
+        rewrite = rewrite_question(question, history)
+        outcome["rewrite"] = vars(rewrite)
+        outcome["question"] = rewrite.standalone
+
+    # Step 1: question -> SQL with the local LLM
+    try:
+        generation = generate_sql(outcome["question"])
+    except SQLGenerationError as exc:
+        outcome["error"], outcome["error_stage"] = str(exc), "SQL generation"
+        _remember(outcome, "failed")
+        return
+    outcome["generation"] = vars(generation)
+    if generation.status != "ok":                 # clarify / unanswerable
+        outcome["notice"] = (generation.status, generation.message)
+        _remember(outcome, generation.status, generation.message)
+        return
+    outcome["sql"] = generation.sql
+
+    _check_and_run(outcome)
+    _remember(outcome, "ok" if outcome["error"] is None else "failed")
+
+
+def _check_and_run(outcome: dict) -> None:
     # Step 2: application-level security - the SQL validator.
     # Every query (from the LLM or typed by hand) is checked before it runs.
     validation = validate_sql(outcome["sql"])
@@ -106,6 +127,19 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
         outcome["result"] = run_query(validation.sql)
     except DatabaseError as exc:
         outcome["error"], outcome["error_stage"] = str(exc), "SQL execution"
+
+
+def _remember(outcome: dict, status: str, message: str = "") -> None:
+    """Add this exchange to the conversation history (Phase 8)."""
+    turn = make_turn(outcome["asked"], outcome["question"], status, message)
+    st.session_state.history = add_turn(st.session_state.get("history", []), turn)
+
+
+def new_conversation() -> None:
+    """Button callback: forget the conversation and clear the page."""
+    st.session_state.history = []
+    st.session_state.pop("outcome", None)
+    st.session_state.question = ""
 
 
 def use_example(question: str) -> None:
@@ -157,6 +191,21 @@ def render_sidebar(settings) -> None:
         st.toggle("✍️ Explain results automatically", value=True, key="auto_explain",
                   help="Turn off to save time; you can still click 'Explain these results'.")
 
+        st.subheader("💬 Conversation")
+        st.toggle("Remember previous questions", value=True, key="use_memory",
+                  help="Lets you ask follow-ups such as 'What about February?'")
+        history = st.session_state.get("history", [])
+        st.caption(f"{len(history)} question(s) so far · the model sees the last "
+                   f"{MAX_HISTORY_TURNS}. Kept only in this browser session.")
+        if history:
+            with st.expander("Conversation so far"):
+                for i, turn in enumerate(history, start=1):
+                    line = f"**{i}.** {turn['original']}"
+                    if turn["question"] != turn["original"]:
+                        line += f"  \n→ *{turn['question']}*"
+                    st.markdown(line)
+        st.button("🗑️ New conversation", width="stretch", on_click=new_conversation)
+
         if st.button("🔄 Refresh status", width="stretch"):
             st.cache_data.clear()
             schema.clear_cache()           # re-read tables and columns too
@@ -173,8 +222,16 @@ def render_outcome() -> None:
         return
 
     st.divider()
-    if outcome["question"]:
-        st.markdown(f"**Question:** {outcome['question']}")
+    if outcome["asked"]:
+        st.markdown(f"**Question:** {outcome['asked']}")
+    rewrite = outcome.get("rewrite")
+    if rewrite and rewrite["rewritten"]:
+        st.info(f"🔗 **Follow-up ({rewrite['follow_up_type']}) understood as:** "
+                f"{rewrite['standalone']}  \n"
+                f"Based on your previous questions ({rewrite['seconds']:.1f} s). "
+                "If this is wrong, ask the full question or start a new conversation.")
+    elif rewrite and rewrite["error"]:
+        st.caption(f"🔗 {rewrite['error']}")
 
     generation = outcome["generation"]
     if generation:
@@ -346,8 +403,6 @@ def main() -> None:
         st.error(f"Configuration problem: {exc}")
         st.stop()
 
-    render_sidebar(settings)
-
     st.title("🧠 GenAI SQL Assistant")
     st.caption("Ask questions about the GenAI_Demo_DB database in plain English. "
                "Everything runs locally; no paid AI API.")
@@ -396,6 +451,10 @@ def main() -> None:
                 with st.spinner("Running..."):
                     run_pipeline(None, sql=manual_sql.strip())
                 st.rerun()   # redraw so the results appear under the question box
+
+    # The sidebar is drawn LAST, so it shows the state AFTER this question ran
+    # (e.g. the conversation counter). Streamlit places it on the left anyway.
+    render_sidebar(settings)
 
 
 main()
