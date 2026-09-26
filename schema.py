@@ -32,6 +32,12 @@ APPROVED_TABLES: list[str] = ["Customers", "Products", "Orders", "OrderDetails",
 # Text columns with at most this many different values get a "values:" hint.
 MAX_SAMPLE_VALUES = 12
 
+# Phase 9 "value linking": text columns with at most this many values are kept
+# as a lookup list, so a question mentioning "Laptop Pro 14" can be linked to
+# the Products table. These values are used for matching in Python only and
+# are NEVER sent to the LLM.
+MAX_LOOKUP_VALUES = 50
+
 # Columns whose contents must never be sent to the LLM as examples.
 # (Here the model runs locally, but with a cloud API this would be a
 #  data-leak: real customer data leaving the company.)
@@ -45,7 +51,8 @@ class Column:
     name: str
     data_type: str          # e.g. "nvarchar(50)", "decimal(10,2)", "date"
     is_primary_key: bool = False
-    sample_values: list[str] = field(default_factory=list)
+    sample_values: list[str] = field(default_factory=list)   # shown in the prompt
+    lookup_values: list[str] = field(default_factory=list)   # Phase 9: matching only
 
 
 @dataclass
@@ -67,10 +74,18 @@ class DatabaseSchema:
     tables: list[Table]
     foreign_keys: list[ForeignKey]
 
-    def to_prompt_text(self) -> str:
-        """Compact, SQL-like text that small models understand well."""
+    def table_names(self) -> list[str]:
+        return [t.name for t in self.tables]
+
+    def to_prompt_text(self, only: set[str] | None = None) -> str:
+        """Compact, SQL-like text that small models understand well.
+
+        only: describe just these tables (Phase 9 schema retrieval).
+        """
         lines: list[str] = []
         for table in self.tables:
+            if only is not None and table.name not in only:
+                continue
             lines.append(f"dbo.{table.name} (")
             for i, col in enumerate(table.columns):
                 text = f"  {col.name} {col.data_type}"
@@ -84,9 +99,11 @@ class DatabaseSchema:
                 lines.append(text)
             lines.append(")")
             lines.append("")
-        if self.foreign_keys:
+        fks = [fk for fk in self.foreign_keys
+               if only is None or (fk.table in only and fk.ref_table in only)]
+        if fks:
             lines.append("Relationships (use these for JOINs):")
-            for fk in self.foreign_keys:
+            for fk in fks:
                 lines.append(f"  dbo.{fk.table}.{fk.column} -> dbo.{fk.ref_table}.{fk.ref_column}")
         return "\n".join(lines).strip()
 
@@ -114,16 +131,16 @@ def _quote(name: str) -> str:
     return "[" + name.replace("]", "]]") + "]"
 
 
-def _sample_values(table: str, column: str) -> list[str]:
-    """Distinct values of a text column, only if there are few of them."""
+def _distinct_values(table: str, column: str, limit: int) -> list[str] | None:
+    """Distinct values of a text column, or None if there are more than `limit`."""
     result = run_query(
-        f"SELECT TOP ({MAX_SAMPLE_VALUES + 1}) v "
+        f"SELECT TOP ({limit + 1}) v "
         f"FROM (SELECT DISTINCT {_quote(column)} AS v FROM dbo.{_quote(table)} "
         f"      WHERE {_quote(column)} IS NOT NULL) AS d "
         f"ORDER BY v"
     )
     values = [str(v) for v in result.dataframe["v"].tolist()]
-    return values if len(values) <= MAX_SAMPLE_VALUES else []
+    return values if len(values) <= limit else None
 
 
 def load_schema() -> DatabaseSchema:
@@ -185,7 +202,10 @@ def load_schema() -> DatabaseSchema:
             )
             if (row["DATA_TYPE"] in _TEXT_TYPES and not col.is_primary_key
                     and (table_name, col.name) not in NO_SAMPLE_COLUMNS):
-                col.sample_values = _sample_values(table_name, col.name)
+                values = _distinct_values(table_name, col.name, MAX_LOOKUP_VALUES) or []
+                col.lookup_values = values
+                if len(values) <= MAX_SAMPLE_VALUES:
+                    col.sample_values = values
             cols.append(col)
         if cols:                                   # skip tables that do not exist
             tables.append(Table(table_name, cols))

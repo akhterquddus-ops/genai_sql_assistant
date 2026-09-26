@@ -4,6 +4,9 @@ test_text_to_sql.py - Phase 5 evaluation: how good is the local model?
 Run from the project folder (Ollama running, read-only login in .env):
     python test_text_to_sql.py
 
+Phase 9 experiment - the same test with schema retrieval forced on (PowerShell):
+    $env:SCHEMA_RETRIEVAL="always"; python test_text_to_sql.py; Remove-Item Env:SCHEMA_RETRIEVAL
+
 For each test question we:
   1. ask the local LLM for SQL
   2. run the LLM's SQL AND a hand-written reference SQL
@@ -138,6 +141,8 @@ def main() -> None:
             print(f"   ❌ model answered '{gen.status}': {gen.message}\n")
             continue
 
+        if gen.retrieval and gen.retrieval.mode == "retrieved":
+            print(f"   Tables: {', '.join(gen.retrieval.tables)}")
         print("   SQL: " + " ".join(gen.sql.split()))
         validation = validate_sql(gen.sql)           # never run unchecked LLM SQL
         if not validation.is_valid:

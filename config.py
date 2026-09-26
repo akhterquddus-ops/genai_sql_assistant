@@ -169,3 +169,32 @@ def get_currency() -> tuple[str, str]:
     """(symbol, name) used when the AI explanation mentions money."""
     return (_get("CURRENCY_SYMBOL", "Rs.") or "Rs.",
             _get("CURRENCY_NAME", "Pakistani Rupees") or "Pakistani Rupees")
+
+
+# ---------------------------------------------------------------------------
+# Schema retrieval (RAG) - Phase 9
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RetrievalSettings:
+    mode: str               # "auto", "always" or "never"
+    embedding_model: str    # e.g. nomic-embed-text
+    top_k: int              # tables chosen by similarity (before adding JOIN tables)
+    auto_threshold: int     # "auto": retrieve only if the full schema exceeds this many tokens
+
+
+def load_retrieval_settings() -> RetrievalSettings:
+    mode = (_get("SCHEMA_RETRIEVAL", "auto") or "auto").split("#", 1)[0].strip().lower()
+    if mode not in ("auto", "always", "never"):
+        raise ConfigError("SCHEMA_RETRIEVAL must be auto, always or never.")
+    return RetrievalSettings(
+        mode=mode,
+        embedding_model=_get("EMBEDDING_MODEL", "nomic-embed-text") or "nomic-embed-text",
+        top_k=_get_int("RETRIEVAL_TOP_K", 4),
+        auto_threshold=_get_int("RETRIEVAL_AUTO_THRESHOLD_TOKENS", 1500),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_retrieval_settings() -> RetrievalSettings:
+    return load_retrieval_settings()

@@ -233,3 +233,32 @@ def chat_stream(messages: list[dict], system: str | None = None,
                     break
         except requests.RequestException as exc:
             raise OllamaError(f"The connection to Ollama was interrupted: {exc}") from exc
+
+
+def embed(texts: list[str], model: str, settings: OllamaSettings | None = None) -> list[list[float]]:
+    """Turn texts into embedding vectors (Phase 9).
+
+    An embedding model does not write text. It turns text into a list of
+    numbers (768 for nomic-embed-text) that captures its MEANING: texts
+    about similar things get similar vectors, even with different words
+    ("salary" and "pay", "orders" and "purchases").
+    """
+    settings = settings or get_ollama_settings()
+    try:
+        response = requests.post(f"{settings.url}/api/embed",
+                                 json={"model": model, "input": texts, "keep_alive": "10m"},
+                                 timeout=settings.timeout)
+    except requests.ConnectionError as exc:
+        raise OllamaError(
+            "Ollama is not running. Start the Ollama app (or run 'ollama serve')."
+        ) from exc
+    except requests.Timeout as exc:
+        raise OllamaError(f"The embedding model did not answer within {settings.timeout}s.") from exc
+    if response.status_code == 404:
+        raise OllamaError(f"Embedding model '{model}' is not downloaded. Run: ollama pull {model}")
+    if not response.ok:
+        raise OllamaError(f"Ollama returned an error ({response.status_code}): {response.text[:200]}")
+    vectors = response.json().get("embeddings", [])
+    if len(vectors) != len(texts):
+        raise OllamaError("Ollama returned the wrong number of embeddings.")
+    return vectors

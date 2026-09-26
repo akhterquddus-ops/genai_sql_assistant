@@ -6,7 +6,10 @@ PHASE 5 VERSION (replaces the Phase 3 placeholder):
     question
        |
        v
-    system prompt = rules + live schema (schema.py + prompts.py)
+    schema retrieval (Phase 9): all tables, or only the relevant ones
+       |
+       v
+    system prompt = rules + schema (schema_retriever.py + prompts.py)
        |
        v
     Ollama -> local model  (answer forced into JSON: structured output)
@@ -30,7 +33,7 @@ from dataclasses import dataclass
 from config import get_ollama_settings
 from ollama_client import OllamaError, chat
 from prompts import SQL_RESPONSE_SCHEMA, build_system_prompt, build_user_message
-from schema import get_schema_text
+from schema_retriever import RetrievalInfo, select_schema
 
 
 class SQLGenerationError(Exception):
@@ -48,6 +51,7 @@ class GenerationResult:
     elapsed_seconds: float
     prompt_tokens: int
     output_tokens: int
+    retrieval: RetrievalInfo | None = None   # which tables were sent (Phase 9)
 
 
 # The example questions from the project brief, shown as buttons in the app.
@@ -71,13 +75,14 @@ EXAMPLE_QUESTIONS: list[str] = [
 ]
 
 
-def generate_sql(question: str) -> GenerationResult:
+def generate_sql(question: str, retrieval_mode: str | None = None) -> GenerationResult:
+    """retrieval_mode: "auto" / "always" / "never" (None = use .env setting)."""
     question = question.strip()
     if not question:
         raise SQLGenerationError("The question is empty.")
 
     try:
-        schema_text = get_schema_text()
+        schema_text, retrieval = select_schema(question, retrieval_mode)
     except Exception as exc:
         raise SQLGenerationError(f"Could not read the database schema: {exc}") from exc
 
@@ -99,6 +104,7 @@ def generate_sql(question: str) -> GenerationResult:
         elapsed_seconds=reply.elapsed_seconds,
         prompt_tokens=reply.prompt_tokens,
         output_tokens=reply.output_tokens,
+        retrieval=retrieval,
     )
 
 

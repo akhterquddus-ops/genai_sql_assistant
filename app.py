@@ -3,8 +3,9 @@ app.py - GenAI SQL Assistant (Streamlit web interface)
 
 Start with:   streamlit run app.py
 
-Pipeline (Phase 8):
+Pipeline (Phase 9):
     question -> (follow-up? rewrite into a standalone question)
+             -> (large schema? retrieve only the relevant tables)
              -> local LLM writes SQL -> SQL validator -> read-only login
              -> SQL Server -> results -> local LLM explains the results
 
@@ -14,7 +15,8 @@ Phase history:
   Phase 5  the local LLM generates the SQL
   Phase 6  SQL validator checks every query before it runs
   Phase 7  the local LLM explains the results
-  Phase 8  conversation memory for follow-up questions      <- this version
+  Phase 8  conversation memory for follow-up questions
+  Phase 9  schema retrieval (RAG)                           <- this version
 """
 
 import time
@@ -22,8 +24,9 @@ import time
 import streamlit as st
 
 import schema
+import schema_retriever
 from conversation import MAX_HISTORY_TURNS, add_turn, make_turn, rewrite_question
-from config import ConfigError, get_ollama_settings, get_settings
+from config import ConfigError, get_ollama_settings, get_retrieval_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
 from ollama_client import OllamaError
 from ollama_client import get_status as get_ollama_status
@@ -87,14 +90,17 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
         outcome["rewrite"] = vars(rewrite)
         outcome["question"] = rewrite.standalone
 
-    # Step 1: question -> SQL with the local LLM
+    # Step 1: question -> SQL with the local LLM (schema chosen by retrieval)
     try:
-        generation = generate_sql(outcome["question"])
+        generation = generate_sql(outcome["question"],
+                                  retrieval_mode=SCHEMA_MODES[st.session_state.get("schema_mode", DEFAULT_SCHEMA_MODE)])
     except SQLGenerationError as exc:
         outcome["error"], outcome["error_stage"] = str(exc), "SQL generation"
         _remember(outcome, "failed")
         return
     outcome["generation"] = vars(generation)
+    if generation.retrieval:
+        outcome["generation"]["retrieval"] = vars(generation.retrieval)
     if generation.status != "ok":                 # clarify / unanswerable
         outcome["notice"] = (generation.status, generation.message)
         _remember(outcome, generation.status, generation.message)
@@ -140,6 +146,15 @@ def new_conversation() -> None:
     st.session_state.history = []
     st.session_state.pop("outcome", None)
     st.session_state.question = ""
+
+
+# Sidebar labels -> SCHEMA_RETRIEVAL modes (Phase 9)
+SCHEMA_MODES = {
+    "Automatic (by schema size)": "auto",
+    "Only relevant tables (RAG)": "always",
+    "All tables": "never",
+}
+DEFAULT_SCHEMA_MODE = "Automatic (by schema size)"
 
 
 def use_example(question: str) -> None:
@@ -191,6 +206,16 @@ def render_sidebar(settings) -> None:
         st.toggle("✍️ Explain results automatically", value=True, key="auto_explain",
                   help="Turn off to save time; you can still click 'Explain these results'.")
 
+        st.subheader("📚 Schema sent to the model")
+        st.selectbox("Schema", list(SCHEMA_MODES), key="schema_mode", label_visibility="collapsed",
+                     help="RAG: find the relevant tables with embeddings and send only those.")
+        try:
+            rs = get_retrieval_settings()
+            st.caption(f"Embedding model: `{rs.embedding_model}` · top {rs.top_k} tables "
+                       f"(+ JOIN tables) · automatic above ~{rs.auto_threshold:,} tokens")
+        except ConfigError as exc:
+            st.caption(f"Retrieval settings problem: {exc}")
+
         st.subheader("💬 Conversation")
         st.toggle("Remember previous questions", value=True, key="use_memory",
                   help="Lets you ask follow-ups such as 'What about February?'")
@@ -209,6 +234,7 @@ def render_sidebar(settings) -> None:
         if st.button("🔄 Refresh status", width="stretch"):
             st.cache_data.clear()
             schema.clear_cache()           # re-read tables and columns too
+            schema_retriever.clear_cache() # and rebuild the table embeddings
             st.rerun()
 
 
@@ -238,6 +264,8 @@ def render_outcome() -> None:
         st.caption(f"🤖 {generation['model']} answered in {generation['elapsed_seconds']:.1f} s "
                    f"({generation['prompt_tokens']:,} prompt tokens + "
                    f"{generation['output_tokens']:,} output tokens)")
+
+    render_retrieval_caption(generation)
 
     # The model asked for clarification or said the data does not exist
     if outcome["notice"]:
@@ -381,6 +409,22 @@ def show_explanation_notes(explanation: dict) -> None:
             st.code(explanation["facts"], language="text")
 
 
+def render_retrieval_caption(generation: dict | None) -> None:
+    info = (generation or {}).get("retrieval")
+    if not info:
+        return
+    if info["mode"] == "retrieved":
+        joins = (f"; {', '.join(info['added_for_values'])} added by value match"
+                 if info.get("added_for_values") else "")
+        joins += f"; {', '.join(info['added_for_joins'])} added for JOINs" if info["added_for_joins"] else ""
+        st.caption(f"📚 Tables sent to the model: **{', '.join(info['tables'])}** "
+                   f"({len(info['tables'])} of {info['total_tables']}{joins}) · "
+                   f"~{info['prompt_tokens_sent']:,} instead of ~{info['prompt_tokens_full']:,} "
+                   f"schema tokens · retrieval {info['seconds']:.1f} s")
+    else:
+        st.caption(f"📚 All {info['total_tables']} tables sent: {info['reason']}.")
+
+
 def render_behind_the_scenes(generation: dict | None) -> None:
     """Show exactly what was sent to and received from the LLM (for teaching)."""
     if not generation:
@@ -390,6 +434,14 @@ def render_behind_the_scenes(generation: dict | None) -> None:
         st.code(generation["system_prompt"], language="text")
         st.markdown("**Raw model output** (structured JSON):")
         st.code(generation["raw_output"], language="json")
+        info = generation.get("retrieval")
+        if info and info["scores"]:
+            st.markdown("**Schema retrieval scores** (similarity to the question; higher = more relevant):")
+            ranked = sorted(info["scores"].items(), key=lambda kv: kv[1], reverse=True)
+            st.dataframe(
+                [{"Table": t, "Score": round(v, 3), "Sent": "✅" if t in info["tables"] else ""}
+                 for t, v in ranked],
+                hide_index=True)
 
 
 # ---------------------------------------------------------------------------
