@@ -3,14 +3,14 @@ app.py - GenAI SQL Assistant (Streamlit web interface)
 
 Start with:   streamlit run app.py
 
-Pipeline (Phase 5):
-    question -> local LLM writes SQL -> safety gate -> SQL Server -> results
+Pipeline (Phase 6):
+    question -> local LLM writes SQL -> SQL VALIDATOR -> read-only login -> SQL Server -> results
 
 Phase history:
   Phase 3  page layout
   Phase 4  Ollama status in the sidebar
-  Phase 5  the local LLM generates the SQL          <- this version
-  Phase 6  SQL validator replaces the simple safety gate
+  Phase 5  the local LLM generates the SQL
+  Phase 6  SQL validator checks every query before it runs   <- this version
   Phase 7  AI explanation of the results
 """
 
@@ -21,6 +21,7 @@ from config import ConfigError, get_ollama_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
 from ollama_client import get_status as get_ollama_status
 from sql_generator import EXAMPLE_QUESTIONS, SQLGenerationError, generate_sql
+from sql_validator import validate_sql
 
 st.set_page_config(page_title="GenAI SQL Assistant", page_icon="🧠", layout="wide")
 
@@ -57,12 +58,12 @@ def get_llm_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# The pipeline: question -> SQL -> safety gate -> results
+# The pipeline: question -> SQL -> validator -> read-only login -> results
 # The outcome is stored in st.session_state so it survives re-runs.
 # ---------------------------------------------------------------------------
 
 def run_pipeline(question: str | None, sql: str | None = None) -> None:
-    outcome = {"question": question, "sql": sql, "generation": None,
+    outcome = {"question": question, "sql": sql, "generation": None, "validation": None,
                "notice": None, "result": None, "error": None, "error_stage": None}
     st.session_state.outcome = outcome
 
@@ -79,18 +80,25 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
             return
         outcome["sql"] = generation.sql
 
-    # Step 2: safety gate.
-    # Until the SQL validator exists (Phase 6), the read-only database login is
-    # our only protection, so we refuse to run anything without it.
+    # Step 2: application-level security - the SQL validator.
+    # Every query (from the LLM or typed by hand) is checked before it runs.
+    validation = validate_sql(outcome["sql"])
+    outcome["validation"] = vars(validation)
+    if not validation.is_valid:
+        outcome["error"], outcome["error_stage"] = validation.reason, "SQL validation"
+        return
+
+    # Step 3: database-level security - the login must be read-only.
+    # Two independent layers: if one ever fails, the other still protects us.
     if get_read_only_status() is not True:
         outcome["error"] = ("SQL was not executed because the database login is not "
                             "confirmed read-only. Use the genai_reader login.")
         outcome["error_stage"] = "Safety check"
         return
 
-    # Step 3: SQL -> database -> DataFrame
+    # Step 4: run the validated SQL -> DataFrame
     try:
-        outcome["result"] = run_query(outcome["sql"])
+        outcome["result"] = run_query(validation.sql)
     except DatabaseError as exc:
         outcome["error"], outcome["error_stage"] = str(exc), "SQL execution"
 
@@ -128,7 +136,7 @@ def render_sidebar(settings) -> None:
         else:
             st.info("Permissions could not be checked.")
         st.caption(f"Row limit: {settings.max_rows:,} · Query timeout: {settings.query_timeout}s  \n"
-                   "SQL validator: coming in Phase 6")
+                   "SQL validator: active (SELECT only, approved tables)")
 
         st.subheader("🤖 Local LLM")
         llm = get_llm_status()
@@ -186,9 +194,19 @@ def render_outcome() -> None:
     else:
         st.caption("No SQL was produced.")
 
+    # Validation status
+    validation = outcome["validation"]
+    if validation and validation["is_valid"]:
+        st.caption("🛡️ Validator passed: " + " · ".join(validation["checks"])
+                   + f" · Tables: {', '.join(validation['tables'])}")
+
     # Execution status
     if outcome["error"]:
-        st.error(f"**{outcome['error_stage']} failed:** {outcome['error']}")
+        if outcome["error_stage"] == "SQL validation":
+            st.error(f"🛡️ **Blocked by the SQL validator:** {outcome['error']}  \n"
+                     "This query was NOT sent to the database.")
+        else:
+            st.error(f"**{outcome['error_stage']} failed:** {outcome['error']}")
         render_behind_the_scenes(generation)
         return
 
@@ -287,9 +305,9 @@ def main() -> None:
 
     # Developer tool: run SQL typed by hand
     with st.expander("🛠️ Developer: run your own SQL"):
-        st.caption("Useful for testing. Until the SQL validator exists (Phase 6), "
-                   "only the database permissions protect us, so this is "
-                   "allowed ONLY with a read-only login.")
+        st.caption("Your SQL goes through exactly the same checks as the LLM's: "
+                   "the SQL validator, then the read-only login. Try an attack, "
+                   "e.g.  SELECT 1 FROM dbo.Customers; DROP TABLE dbo.Customers")
         manual_sql = st.text_area("SQL", height=120, key="manual_sql",
                                   placeholder="SELECT TOP 5 ProductName, Price FROM dbo.Products;")
         if st.button("Run SQL"):

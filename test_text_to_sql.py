@@ -25,8 +25,9 @@ import pandas as pd
 from database import DatabaseError, check_permissions, run_query
 from ollama_client import get_status
 from sql_generator import SQLGenerationError, generate_sql
+from sql_validator import validate_sql
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.ERROR)
 
 # Hand-written reference answers (the "gold standard").
 # They select only the ESSENTIAL columns: the model may add extra columns
@@ -138,8 +139,12 @@ def main() -> None:
             continue
 
         print("   SQL: " + " ".join(gen.sql.split()))
+        validation = validate_sql(gen.sql)           # never run unchecked LLM SQL
+        if not validation.is_valid:
+            print(f"   ❌ blocked by validator: {validation.reason}  ({gen.elapsed_seconds:.1f}s)\n")
+            continue
         try:
-            model_df = run_query(gen.sql).dataframe
+            model_df = run_query(validation.sql).dataframe
         except DatabaseError as exc:
             print(f"   ❌ model SQL failed: {exc}  ({gen.elapsed_seconds:.1f}s)\n")
             continue

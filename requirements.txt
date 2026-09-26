@@ -8,3 +8,6 @@ streamlit>=1.50
 
 # Phase 4 - talking to the local Ollama server
 requests>=2.31
+
+# Phase 6 - SQL parser used by the validator
+sqlglot>=26.0
