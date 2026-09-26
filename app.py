@@ -5,9 +5,9 @@ Start with:   streamlit run app.py
 
 PHASE 3: the complete page layout, without AI.
   question -> sql_generator (placeholder) -> database -> results table
+PHASE 4: the sidebar shows the local LLM (Ollama) status.
 
 Later phases plug into the empty places:
-  Phase 4  Ollama status in the sidebar
   Phase 5  sql_generator uses the local LLM
   Phase 6  SQL validator between generation and execution
   Phase 7  AI explanation of the results
@@ -15,8 +15,9 @@ Later phases plug into the empty places:
 
 import streamlit as st
 
-from config import ConfigError, get_settings
+from config import ConfigError, get_ollama_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
+from ollama_client import get_status as get_ollama_status
 from sql_generator import EXAMPLE_QUESTIONS, SQLGenerationError, generate_sql
 
 st.set_page_config(page_title="GenAI SQL Assistant", page_icon="🧠", layout="wide")
@@ -40,6 +41,17 @@ def get_read_only_status() -> bool | None:
         return check_permissions()["read_only"]
     except Exception:
         return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_llm_status() -> dict:
+    """Ollama status as a plain dict (cache-friendly)."""
+    try:
+        status = get_ollama_status(get_ollama_settings())
+    except ConfigError as exc:
+        return {"running": False, "model_available": False, "model": "?",
+                "version": None, "message": str(exc)}
+    return vars(status)
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +81,11 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
 
 
 def use_example(question: str) -> None:
-    """Button callback: put an example question into the input box."""
+    """Button callback: put the example in the input box AND ask it.
+    Callbacks run before the page is redrawn, so the results appear
+    straight away."""
     st.session_state.question = question
+    run_pipeline(question)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +117,16 @@ def render_sidebar(settings) -> None:
         st.caption(f"Row limit: {settings.max_rows:,} · Query timeout: {settings.query_timeout}s")
 
         st.subheader("🤖 Local LLM")
-        st.info("Ollama: not connected yet (Phase 4)")
-        st.markdown("**Model:** —")
+        llm = get_llm_status()
+        if llm["running"] and llm["model_available"]:
+            st.success("Ollama running · model ready")
+        elif llm["running"]:
+            st.warning("Ollama running · model missing")
+        else:
+            st.error("Ollama not available")
+        st.caption(llm["message"])
+        st.markdown(f"**Model:** `{llm['model']}`  \n"
+                    "**Runs on:** this computer (no cloud, no API cost)")
 
         if st.button("🔄 Refresh status", width="stretch"):
             st.cache_data.clear()
@@ -199,8 +222,11 @@ def main() -> None:
             with st.spinner("Working..."):
                 run_pipeline(question.strip())
 
+    # Results appear directly under the question box.
+    render_outcome()
+
     # Example questions
-    with st.expander("💡 Example questions (the only ones that work in Phase 3)"):
+    with st.expander("💡 Example questions (click one to ask it; only these work in Phase 3)"):
         cols = st.columns(2)
         for i, example in enumerate(EXAMPLE_QUESTIONS):
             cols[i % 2].button(example, key=f"example_{i}", width="stretch",
@@ -221,8 +247,7 @@ def main() -> None:
             else:
                 with st.spinner("Running..."):
                     run_pipeline(None, sql=manual_sql.strip())
-
-    render_outcome()
+                st.rerun()   # redraw so the results appear under the question box
 
 
 main()

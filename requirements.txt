@@ -6,5 +6,5 @@ python-dotenv>=1.0
 # Phase 3 - web interface
 streamlit>=1.50
 
-# Added in later phases:
-# requests    (Phase 4 - talking to Ollama)
+# Phase 4 - talking to the local Ollama server
+requests>=2.31

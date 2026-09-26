@@ -12,6 +12,7 @@ directly. That keeps validation and defaults in one place.
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -99,3 +100,58 @@ def load_settings() -> DatabaseSettings:
 def get_settings() -> DatabaseSettings:
     """Load settings once and reuse them (cached)."""
     return load_settings()
+
+
+# ---------------------------------------------------------------------------
+# Local LLM (Ollama) settings - Phase 4
+# ---------------------------------------------------------------------------
+
+# Hosts that mean "this computer". Anything else would send our database
+# schema and results over the network, which this project must not do.
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _get_float(name: str, default: float) -> float:
+    raw = _get(name, str(default)).split("#", 1)[0].strip()
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError(f"Setting '{name}' must be a number, got '{raw}'.")
+
+
+@dataclass(frozen=True)
+class OllamaSettings:
+    url: str             # where the Ollama server listens
+    model: str           # e.g. qwen2.5-coder:3b
+    timeout: int         # seconds to wait for one answer
+    temperature: float   # 0 = most predictable output (best for SQL)
+    context_size: int    # tokens the model can "see" at once (prompt + answer)
+
+
+def load_ollama_settings() -> OllamaSettings:
+    url = _get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+    host = urlparse(url).hostname or ""
+    allow_remote = _get_bool("OLLAMA_ALLOW_REMOTE", False)
+    if host not in _LOCAL_HOSTS and not allow_remote:
+        raise ConfigError(
+            f"OLLAMA_URL points to '{host}', which is not this computer. "
+            "This project keeps all data local. Set OLLAMA_ALLOW_REMOTE=yes "
+            "only if you really mean to use another machine."
+        )
+
+    temperature = _get_float("OLLAMA_TEMPERATURE", 0.0)
+    if not 0.0 <= temperature <= 2.0:
+        raise ConfigError("OLLAMA_TEMPERATURE must be between 0 and 2.")
+
+    return OllamaSettings(
+        url=url,
+        model=_get("OLLAMA_MODEL", "qwen2.5-coder:3b"),
+        timeout=_get_int("OLLAMA_TIMEOUT", 180),
+        temperature=temperature,
+        context_size=_get_int("OLLAMA_CONTEXT_SIZE", 4096),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_ollama_settings() -> OllamaSettings:
+    return load_ollama_settings()
