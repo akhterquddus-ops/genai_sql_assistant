@@ -109,11 +109,15 @@ def get_status(settings: OllamaSettings | None = None) -> OllamaStatus:
 
 def chat(messages: list[dict], system: str | None = None,
          temperature: float | None = None,
+         response_format: dict | str | None = None,
          settings: OllamaSettings | None = None) -> ChatResult:
     """Send a conversation to the local model and return its reply.
 
-    messages: [{"role": "user" | "assistant", "content": "..."}, ...]
-    system:   optional instructions that shape every answer (the "system prompt")
+    messages:        [{"role": "user" | "assistant", "content": "..."}, ...]
+    system:          instructions that shape every answer (the "system prompt")
+    response_format: "json", or a JSON schema dict. Ollama then FORCES the
+                     answer into that shape ("structured output"), so our
+                     code can read it reliably.
     """
     settings = settings or get_ollama_settings()
     if system:
@@ -129,6 +133,8 @@ def chat(messages: list[dict], system: str | None = None,
             "num_ctx": settings.context_size,
         },
     }
+    if response_format is not None:
+        payload["format"] = response_format
 
     start = time.perf_counter()
     try:

@@ -3,18 +3,20 @@ app.py - GenAI SQL Assistant (Streamlit web interface)
 
 Start with:   streamlit run app.py
 
-PHASE 3: the complete page layout, without AI.
-  question -> sql_generator (placeholder) -> database -> results table
-PHASE 4: the sidebar shows the local LLM (Ollama) status.
+Pipeline (Phase 5):
+    question -> local LLM writes SQL -> safety gate -> SQL Server -> results
 
-Later phases plug into the empty places:
-  Phase 5  sql_generator uses the local LLM
-  Phase 6  SQL validator between generation and execution
+Phase history:
+  Phase 3  page layout
+  Phase 4  Ollama status in the sidebar
+  Phase 5  the local LLM generates the SQL          <- this version
+  Phase 6  SQL validator replaces the simple safety gate
   Phase 7  AI explanation of the results
 """
 
 import streamlit as st
 
+import schema
 from config import ConfigError, get_ollama_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
 from ollama_client import get_status as get_ollama_status
@@ -55,25 +57,38 @@ def get_llm_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# The pipeline: question -> SQL -> results
-# The outcome is stored in st.session_state so it survives re-runs
-# (for example when the sidebar "Refresh" button is clicked).
+# The pipeline: question -> SQL -> safety gate -> results
+# The outcome is stored in st.session_state so it survives re-runs.
 # ---------------------------------------------------------------------------
 
 def run_pipeline(question: str | None, sql: str | None = None) -> None:
-    outcome = {"question": question, "sql": sql, "result": None,
-               "error": None, "error_stage": None}
+    outcome = {"question": question, "sql": sql, "generation": None,
+               "notice": None, "result": None, "error": None, "error_stage": None}
     st.session_state.outcome = outcome
 
-    # Step 1: question -> SQL (skipped when the user typed SQL manually)
+    # Step 1: question -> SQL with the local LLM (skipped for hand-typed SQL)
     if sql is None:
         try:
-            outcome["sql"] = generate_sql(question)
+            generation = generate_sql(question)
         except SQLGenerationError as exc:
             outcome["error"], outcome["error_stage"] = str(exc), "SQL generation"
             return
+        outcome["generation"] = vars(generation)
+        if generation.status != "ok":            # clarify / unanswerable
+            outcome["notice"] = (generation.status, generation.message)
+            return
+        outcome["sql"] = generation.sql
 
-    # Step 2: SQL -> database -> DataFrame
+    # Step 2: safety gate.
+    # Until the SQL validator exists (Phase 6), the read-only database login is
+    # our only protection, so we refuse to run anything without it.
+    if get_read_only_status() is not True:
+        outcome["error"] = ("SQL was not executed because the database login is not "
+                            "confirmed read-only. Use the genai_reader login.")
+        outcome["error_stage"] = "Safety check"
+        return
+
+    # Step 3: SQL -> database -> DataFrame
     try:
         outcome["result"] = run_query(outcome["sql"])
     except DatabaseError as exc:
@@ -81,11 +96,9 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
 
 
 def use_example(question: str) -> None:
-    """Button callback: put the example in the input box AND ask it.
-    Callbacks run before the page is redrawn, so the results appear
-    straight away."""
+    """Button callback: put the example in the input box and ask it on this run."""
     st.session_state.question = question
-    run_pipeline(question)
+    st.session_state.pending_question = question
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +127,8 @@ def render_sidebar(settings) -> None:
             st.warning("This login can MODIFY data. Use the read-only genai_reader login.")
         else:
             st.info("Permissions could not be checked.")
-        st.caption(f"Row limit: {settings.max_rows:,} · Query timeout: {settings.query_timeout}s")
+        st.caption(f"Row limit: {settings.max_rows:,} · Query timeout: {settings.query_timeout}s  \n"
+                   "SQL validator: coming in Phase 6")
 
         st.subheader("🤖 Local LLM")
         llm = get_llm_status()
@@ -130,6 +144,7 @@ def render_sidebar(settings) -> None:
 
         if st.button("🔄 Refresh status", width="stretch"):
             st.cache_data.clear()
+            schema.clear_cache()           # re-read tables and columns too
             st.rerun()
 
 
@@ -146,25 +161,46 @@ def render_outcome() -> None:
     if outcome["question"]:
         st.markdown(f"**Question:** {outcome['question']}")
 
+    generation = outcome["generation"]
+    if generation:
+        st.caption(f"🤖 {generation['model']} answered in {generation['elapsed_seconds']:.1f} s "
+                   f"({generation['prompt_tokens']:,} prompt tokens + "
+                   f"{generation['output_tokens']:,} output tokens)")
+
+    # The model asked for clarification or said the data does not exist
+    if outcome["notice"]:
+        kind, text = outcome["notice"]
+        if kind == "clarify":
+            st.info(f"🤔 **The assistant needs more detail:** {text}")
+        else:
+            st.warning(f"🚫 **Not available in this database:** {text}")
+        render_behind_the_scenes(generation)
+        return
+
     # Generated SQL
     st.subheader("Generated SQL")
     if outcome["sql"]:
         st.code(outcome["sql"], language="sql")
+        if generation and generation["message"]:
+            st.caption(f"Model's description: {generation['message']}")
     else:
         st.caption("No SQL was produced.")
 
     # Execution status
     if outcome["error"]:
         st.error(f"**{outcome['error_stage']} failed:** {outcome['error']}")
+        render_behind_the_scenes(generation)
         return
 
     result = outcome["result"]
     st.success("Query executed successfully")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("Rows returned", f"{result.row_count:,}")
-    col2.metric("Execution time", f"{result.elapsed_seconds:.3f} s")
-    col3.metric("Columns", len(result.dataframe.columns))
+    col2.metric("SQL generation (LLM)",
+                f"{generation['elapsed_seconds']:.1f} s" if generation else "—")
+    col3.metric("Query execution (DB)", f"{result.elapsed_seconds:.3f} s")
+    col4.metric("Columns", len(result.dataframe.columns))
 
     if result.truncated:
         st.warning(f"Only the first {result.row_count:,} rows are shown (row limit).")
@@ -187,6 +223,19 @@ def render_outcome() -> None:
     # AI explanation (Phase 7)
     st.subheader("AI explanation")
     st.info("The local LLM will explain these results in plain English in Phase 7.")
+
+    render_behind_the_scenes(generation)
+
+
+def render_behind_the_scenes(generation: dict | None) -> None:
+    """Show exactly what was sent to and received from the LLM (for teaching)."""
+    if not generation:
+        return
+    with st.expander("🔍 Behind the scenes: what the LLM saw and said"):
+        st.markdown("**System prompt** (rules + live schema, sent with every question):")
+        st.code(generation["system_prompt"], language="text")
+        st.markdown("**Raw model output** (structured JSON):")
+        st.code(generation["raw_output"], language="json")
 
 
 # ---------------------------------------------------------------------------
@@ -215,18 +264,22 @@ def main() -> None:
         )
         asked = st.form_submit_button("Ask", type="primary")
 
+    # A question comes either from the form or from an example button.
+    to_ask = st.session_state.pop("pending_question", None)
     if asked:
-        if not question.strip():
+        to_ask = question.strip()
+        if not to_ask:
             st.warning("Please type a question first.")
-        else:
-            with st.spinner("Working..."):
-                run_pipeline(question.strip())
+
+    if to_ask:
+        with st.spinner("The local model is writing SQL... (the first question takes longer)"):
+            run_pipeline(to_ask)
 
     # Results appear directly under the question box.
     render_outcome()
 
     # Example questions
-    with st.expander("💡 Example questions (click one to ask it; only these work in Phase 3)"):
+    with st.expander("💡 Example questions (click one to ask it)"):
         cols = st.columns(2)
         for i, example in enumerate(EXAMPLE_QUESTIONS):
             cols[i % 2].button(example, key=f"example_{i}", width="stretch",
@@ -238,11 +291,9 @@ def main() -> None:
                    "only the database permissions protect us, so this is "
                    "allowed ONLY with a read-only login.")
         manual_sql = st.text_area("SQL", height=120, key="manual_sql",
-                                  placeholder="SELECT TOP 5 * FROM dbo.Products;")
+                                  placeholder="SELECT TOP 5 ProductName, Price FROM dbo.Products;")
         if st.button("Run SQL"):
-            if get_read_only_status() is not True:
-                st.error("Blocked: the database login is not confirmed read-only.")
-            elif not manual_sql.strip():
+            if not manual_sql.strip():
                 st.warning("Please type some SQL first.")
             else:
                 with st.spinner("Running..."):
