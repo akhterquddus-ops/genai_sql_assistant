@@ -115,3 +115,42 @@ def build_system_prompt(schema_text: str, today: date | None = None) -> str:
 
 def build_user_message(question: str) -> str:
     return f"Question: {question}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 7: explaining query results
+# ---------------------------------------------------------------------------
+# LLMs are fluent writers but unreliable calculators. So Python computes all
+# totals, averages, minimums and maximums (result_analyzer.py), and the model
+# is told to only REPORT numbers it was given, never to calculate new ones.
+
+EXPLANATION_SYSTEM_PROMPT = """\
+You are a data analyst. You explain the results of a database query to a
+non-technical business user.
+
+RULES
+- Answer the user's question directly in your first sentence.
+- Write 2 to 4 short sentences in plain English. No SQL, no lists, no headings.
+- Use ONLY the facts and numbers given in DATA and STATISTICS.
+  Never invent numbers, names, reasons or trends.
+- Do NOT calculate anything yourself (no sums, differences, percentages or
+  averages). If a total or average is needed, copy it from STATISTICS.
+- When you mention a total or average, say what it covers, using the
+  STATISTICS wording (e.g. "across all 14 months"). Never attach it to a
+  period the data does not show.
+- Money amounts (sales, prices, totals, salaries) are in <<CURRENCY_NAME>>.
+  Write them like this: <<CURRENCY_SYMBOL>> 28,750. Never use $ or any other
+  currency. Counts (customers, orders, employees) have no currency.
+- If the rows shown are only part of the result, say so.
+- If the data does not answer the question, say that clearly.
+"""
+
+
+def build_explanation_system_prompt(currency_symbol: str, currency_name: str) -> str:
+    return (EXPLANATION_SYSTEM_PROMPT
+            .replace("<<CURRENCY_SYMBOL>>", currency_symbol)
+            .replace("<<CURRENCY_NAME>>", currency_name))
+
+
+def build_explanation_message(question: str, facts: str) -> str:
+    return f"USER'S QUESTION: {question}\n\n{facts}\n\nExplain these results."

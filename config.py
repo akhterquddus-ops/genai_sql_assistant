@@ -155,3 +155,14 @@ def load_ollama_settings() -> OllamaSettings:
 @lru_cache(maxsize=1)
 def get_ollama_settings() -> OllamaSettings:
     return load_ollama_settings()
+
+
+# ---------------------------------------------------------------------------
+# Display settings - Phase 7
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def get_currency() -> tuple[str, str]:
+    """(symbol, name) used when the AI explanation mentions money."""
+    return (_get("CURRENCY_SYMBOL", "Rs.") or "Rs.",
+            _get("CURRENCY_NAME", "Pakistani Rupees") or "Pakistani Rupees")

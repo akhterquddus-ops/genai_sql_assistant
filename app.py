@@ -3,23 +3,28 @@ app.py - GenAI SQL Assistant (Streamlit web interface)
 
 Start with:   streamlit run app.py
 
-Pipeline (Phase 6):
-    question -> local LLM writes SQL -> SQL VALIDATOR -> read-only login -> SQL Server -> results
+Pipeline (Phase 7):
+    question -> local LLM writes SQL -> SQL validator -> read-only login
+             -> SQL Server -> results -> local LLM explains the results
 
 Phase history:
   Phase 3  page layout
   Phase 4  Ollama status in the sidebar
   Phase 5  the local LLM generates the SQL
-  Phase 6  SQL validator checks every query before it runs   <- this version
-  Phase 7  AI explanation of the results
+  Phase 6  SQL validator checks every query before it runs
+  Phase 7  the local LLM explains the results               <- this version
 """
+
+import time
 
 import streamlit as st
 
 import schema
 from config import ConfigError, get_ollama_settings, get_settings
 from database import DatabaseError, check_permissions, run_query, test_connection
+from ollama_client import OllamaError
 from ollama_client import get_status as get_ollama_status
+from result_analyzer import check_numbers, explain, explain_stream, localise_currency
 from sql_generator import EXAMPLE_QUESTIONS, SQLGenerationError, generate_sql
 from sql_validator import validate_sql
 
@@ -149,6 +154,8 @@ def render_sidebar(settings) -> None:
         st.caption(llm["message"])
         st.markdown(f"**Model:** `{llm['model']}`  \n"
                     "**Runs on:** this computer (no cloud, no API cost)")
+        st.toggle("✍️ Explain results automatically", value=True, key="auto_explain",
+                  help="Turn off to save time; you can still click 'Explain these results'.")
 
         if st.button("🔄 Refresh status", width="stretch"):
             st.cache_data.clear()
@@ -240,9 +247,81 @@ def render_outcome() -> None:
 
     # AI explanation (Phase 7)
     st.subheader("AI explanation")
-    st.info("The local LLM will explain these results in plain English in Phase 7.")
+    render_explanation(outcome, result)
 
     render_behind_the_scenes(generation)
+
+
+def _escape_markdown(text: str) -> str:
+    """Streamlit treats $...$ as a maths formula; money amounts must stay text."""
+    return text.replace("$", "\\$")
+
+
+def render_explanation(outcome: dict, result) -> None:
+    question = outcome["question"] or "Describe what these results show."
+    explanation = outcome.get("explanation")
+
+    # Not explained yet: generate now (streaming) or offer a button.
+    if explanation is None:
+        if result.row_count == 0:
+            explanation = vars(explain(question, result.dataframe))   # no LLM needed
+            explanation["facts"] = ""
+        elif st.session_state.get("auto_explain", True) or st.button("✍️ Explain these results"):
+            explanation = stream_explanation(question, result)
+            outcome["explanation"] = explanation
+            show_explanation_notes(explanation)
+            return
+        else:
+            st.caption("Automatic explanations are switched off in the sidebar.")
+            return
+        outcome["explanation"] = explanation
+
+    # Already explained (e.g. after a re-run): show the stored text.
+    if explanation.get("error"):
+        st.warning(f"The explanation could not be generated: {explanation['error']}")
+        if st.button("↻ Try the explanation again"):
+            outcome["explanation"] = None
+            st.rerun()
+        return
+    st.markdown(_escape_markdown(explanation["text"]))
+    show_explanation_notes(explanation)
+
+
+def stream_explanation(question: str, result) -> dict:
+    """Show the explanation word by word as the model writes it."""
+    start = time.perf_counter()
+    try:
+        pieces, facts, hidden = explain_stream(question, result.dataframe, result.truncated)
+        text = st.write_stream(_escape_markdown(p) for p in pieces)
+    except OllamaError as exc:
+        st.warning(f"The explanation could not be generated: {exc}")
+        return {"error": str(exc)}
+    if not isinstance(text, str):
+        text = "".join(str(t) for t in text)
+    # Final pass on the whole text (a streamed "28,750" + " dollars" is split in two).
+    text = localise_currency(text.replace("\\$", "$")).strip()
+    return {"text": text, "seconds": time.perf_counter() - start,
+            "unverified_numbers": check_numbers(text, facts, question),
+            "hidden_columns": hidden, "used_llm": True, "facts": facts}
+
+
+def show_explanation_notes(explanation: dict) -> None:
+    if explanation.get("error"):
+        return
+    if explanation.get("used_llm"):
+        st.caption(f"✍️ Written by the local LLM from the table above in "
+                   f"{explanation['seconds']:.1f} s. AI-generated text: the table is "
+                   "the source of truth.")
+    if explanation.get("unverified_numbers"):
+        numbers = ", ".join(explanation["unverified_numbers"])
+        st.warning(f"⚠️ **Check these numbers:** {numbers}. They do not appear in the "
+                   "query results, so the model may have invented or miscalculated them.")
+    if explanation.get("hidden_columns"):
+        st.caption("🔒 Not shown to the model (sensitive): "
+                   + ", ".join(explanation["hidden_columns"]))
+    if explanation.get("facts"):
+        with st.expander("🔍 What the model was given to write this explanation"):
+            st.code(explanation["facts"], language="text")
 
 
 def render_behind_the_scenes(generation: dict | None) -> None:

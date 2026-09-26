@@ -6,16 +6,20 @@ We talk to it with ordinary HTTP requests, the same way a program would
 call a cloud AI API. The difference is that the request never leaves the
 machine and costs nothing.
 
-    get_status()   -> is Ollama running, and is our model downloaded?
-    list_models()  -> models installed locally
-    chat(...)      -> send messages, get the model's answer plus timing info
+    get_status()    -> is Ollama running, and is our model downloaded?
+    list_models()   -> models installed locally
+    chat(...)       -> send messages, get the whole answer plus timing info
+    chat_stream(...)-> same, but yields the answer piece by piece as it is
+                       generated ("streaming"), so the user sees text at once
 
 We use the plain `requests` library instead of an SDK so students can see
 exactly what is sent and received.
 """
 
+import json
 import logging
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import requests
@@ -107,39 +111,33 @@ def get_status(settings: OllamaSettings | None = None) -> OllamaStatus:
 # Chat
 # ---------------------------------------------------------------------------
 
-def chat(messages: list[dict], system: str | None = None,
-         temperature: float | None = None,
-         response_format: dict | str | None = None,
-         settings: OllamaSettings | None = None) -> ChatResult:
-    """Send a conversation to the local model and return its reply.
-
-    messages:        [{"role": "user" | "assistant", "content": "..."}, ...]
-    system:          instructions that shape every answer (the "system prompt")
-    response_format: "json", or a JSON schema dict. Ollama then FORCES the
-                     answer into that shape ("structured output"), so our
-                     code can read it reliably.
-    """
-    settings = settings or get_ollama_settings()
+def _build_payload(settings: OllamaSettings, messages: list[dict], system: str | None,
+                   temperature: float | None, response_format: dict | str | None,
+                   max_tokens: int | None, stream: bool) -> dict:
     if system:
         messages = [{"role": "system", "content": system}, *messages]
-
+    options = {
+        "temperature": settings.temperature if temperature is None else temperature,
+        "num_ctx": settings.context_size,
+    }
+    if max_tokens:
+        options["num_predict"] = max_tokens      # hard cap on answer length
     payload = {
         "model": settings.model,
         "messages": messages,
-        "stream": False,          # wait for the whole answer (simpler to handle)
+        "stream": stream,
         "keep_alive": "10m",      # keep the model in memory between questions
-        "options": {
-            "temperature": settings.temperature if temperature is None else temperature,
-            "num_ctx": settings.context_size,
-        },
+        "options": options,
     }
     if response_format is not None:
         payload["format"] = response_format
+    return payload
 
-    start = time.perf_counter()
+
+def _post(settings: OllamaSettings, payload: dict, stream: bool) -> requests.Response:
     try:
         response = requests.post(f"{settings.url}/api/chat", json=payload,
-                                 timeout=settings.timeout)
+                                 timeout=settings.timeout, stream=stream)
     except requests.ConnectionError as exc:
         raise OllamaError(
             "Ollama is not running. Start the Ollama app (or run 'ollama serve')."
@@ -150,15 +148,34 @@ def chat(messages: list[dict], system: str | None = None,
             "(the first answer is slow while the model loads), increase "
             "OLLAMA_TIMEOUT, or use a smaller model."
         ) from exc
-
     if response.status_code == 404:
         raise OllamaError(f"Model '{settings.model}' is not downloaded. "
                           f"Run: ollama pull {settings.model}")
     if not response.ok:
         raise OllamaError(f"Ollama returned an error ({response.status_code}): "
                           f"{response.text[:200]}")
+    return response
 
-    data = response.json()
+
+def chat(messages: list[dict], system: str | None = None,
+         temperature: float | None = None,
+         response_format: dict | str | None = None,
+         max_tokens: int | None = None,
+         settings: OllamaSettings | None = None) -> ChatResult:
+    """Send a conversation to the local model and return its whole reply.
+
+    messages:        [{"role": "user" | "assistant", "content": "..."}, ...]
+    system:          instructions that shape every answer (the "system prompt")
+    response_format: "json", or a JSON schema dict. Ollama then FORCES the
+                     answer into that shape ("structured output"), so our
+                     code can read it reliably.
+    max_tokens:      optional cap on the length of the answer
+    """
+    settings = settings or get_ollama_settings()
+    payload = _build_payload(settings, messages, system, temperature,
+                             response_format, max_tokens, stream=False)
+    start = time.perf_counter()
+    data = _post(settings, payload, stream=False).json()
     elapsed = time.perf_counter() - start
     result = ChatResult(
         content=data.get("message", {}).get("content", "").strip(),
@@ -179,3 +196,37 @@ def chat(messages: list[dict], system: str | None = None,
 def ask(prompt: str, system: str | None = None, **kwargs) -> ChatResult:
     """Shortcut for a single question."""
     return chat([{"role": "user", "content": prompt}], system=system, **kwargs)
+
+
+def chat_stream(messages: list[dict], system: str | None = None,
+                temperature: float | None = None,
+                max_tokens: int | None = None,
+                settings: OllamaSettings | None = None) -> Iterator[str]:
+    """Like chat(), but yield the answer in small pieces as the model writes it.
+
+    Ollama then sends one JSON line per piece: {"message": {"content": "The"}, "done": false}
+    Total time is the same, but the user starts reading after a second or two
+    instead of staring at a spinner.
+    """
+    settings = settings or get_ollama_settings()
+    payload = _build_payload(settings, messages, system, temperature,
+                             None, max_tokens, stream=True)
+    start = time.perf_counter()
+    with _post(settings, payload, stream=True) as response:
+        try:
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                data = json.loads(line)
+                if "error" in data:
+                    raise OllamaError(f"Ollama error: {data['error']}")
+                piece = data.get("message", {}).get("content", "")
+                if piece:
+                    yield piece
+                if data.get("done"):
+                    logger.info("LLM streamed answer in %.1fs (%d prompt + %d output tokens)",
+                                time.perf_counter() - start,
+                                data.get("prompt_eval_count", 0), data.get("eval_count", 0))
+                    break
+        except requests.RequestException as exc:
+            raise OllamaError(f"The connection to Ollama was interrupted: {exc}") from exc
