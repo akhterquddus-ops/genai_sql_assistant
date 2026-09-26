@@ -3,6 +3,8 @@ pandas>=2.2
 pyodbc>=5.1
 python-dotenv>=1.0
 
+# Phase 3 - web interface
+streamlit>=1.50
+
 # Added in later phases:
-# streamlit   (Phase 3 - web interface)
 # requests    (Phase 4 - talking to Ollama)
