@@ -1,0 +1,8 @@
+# Phase 2 - Python <-> SQL Server
+pandas>=2.2
+pyodbc>=5.1
+python-dotenv>=1.0
+
+# Added in later phases:
+# streamlit   (Phase 3 - web interface)
+# requests    (Phase 4 - talking to Ollama)
