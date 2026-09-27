@@ -27,7 +27,7 @@ import pandas as pd
 
 from database import DatabaseError, check_permissions, run_query
 from ollama_client import get_status
-from sql_generator import SQLGenerationError, generate_sql
+from sql_generator import SQLGenerationError, correct_sql, generate_sql, is_correctable
 from sql_validator import validate_sql
 
 logging.basicConfig(level=logging.ERROR)
@@ -114,6 +114,17 @@ def compare(model_df: pd.DataFrame, reference_df: pd.DataFrame) -> tuple[bool, s
     return False, "different values"
 
 
+def _check_and_run(sql: str):
+    """Validate, then run. Returns (DataFrame or None, stage, error, validator rule)."""
+    validation = validate_sql(sql)             # never run unchecked LLM SQL
+    if not validation.is_valid:
+        return None, "SQL validation", validation.reason, validation.rule
+    try:
+        return run_query(validation.sql).dataframe, "", "", None
+    except DatabaseError as exc:
+        return None, "SQL execution", str(exc), None
+
+
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -126,7 +137,7 @@ def main() -> None:
         return
 
     print(f"Model: {status.model}\n")
-    passed, total, times = 0, 0, []
+    passed, total, times, corrected = 0, 0, [], 0
 
     for question, reference in REFERENCE_SQL.items():
         total += 1
@@ -144,14 +155,23 @@ def main() -> None:
         if gen.retrieval and gen.retrieval.mode == "retrieved":
             print(f"   Tables: {', '.join(gen.retrieval.tables)}")
         print("   SQL: " + " ".join(gen.sql.split()))
-        validation = validate_sql(gen.sql)           # never run unchecked LLM SQL
-        if not validation.is_valid:
-            print(f"   ❌ blocked by validator: {validation.reason}  ({gen.elapsed_seconds:.1f}s)\n")
-            continue
-        try:
-            model_df = run_query(validation.sql).dataframe
-        except DatabaseError as exc:
-            print(f"   ❌ model SQL failed: {exc}  ({gen.elapsed_seconds:.1f}s)\n")
+        model_df, stage, error, rule = _check_and_run(gen.sql)
+
+        # Self-correction: one retry for honest mistakes (never for dangerous SQL)
+        if model_df is None and is_correctable(stage, rule, error):
+            print(f"   ⚠️  {stage} failed: {error}")
+            try:
+                fix = correct_sql(question, gen, error)
+            except SQLGenerationError as exc:
+                fix = None
+                print(f"   🔧 retry failed: {exc}")
+            if fix is not None and fix.status == "ok":
+                print("   🔧 corrected SQL: " + " ".join(fix.sql.split()) + f"  ({fix.elapsed_seconds:.1f}s)")
+                model_df, stage, error, rule = _check_and_run(fix.sql)
+                corrected += model_df is not None
+
+        if model_df is None:
+            print(f"   ❌ {stage} failed: {error}  ({gen.elapsed_seconds:.1f}s)\n")
             continue
         reference_df = run_query(reference).dataframe
         ok, reason = compare(model_df, reference_df)
@@ -176,6 +196,7 @@ def main() -> None:
 
     avg = sum(times) / len(times) if times else 0
     print(f"SCORE: {passed}/{total} correct · average generation time {avg:.1f}s")
+    print(f"Self-correction made {corrected} failed quer{'y' if corrected == 1 else 'ies'} runnable")
 
 
 if __name__ == "__main__":

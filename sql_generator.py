@@ -32,7 +32,8 @@ from dataclasses import dataclass
 
 from config import get_ollama_settings
 from ollama_client import OllamaError, chat
-from prompts import SQL_RESPONSE_SCHEMA, build_system_prompt, build_user_message
+from prompts import (SQL_RESPONSE_SCHEMA, build_correction_message, build_system_prompt,
+                     build_user_message)
 from schema_retriever import RetrievalInfo, select_schema
 
 
@@ -153,3 +154,52 @@ def parse_model_output(raw: str) -> tuple[str, str, str]:
                        if status == "clarify"
                        else "The database does not contain that information.")
     return status, sql, message
+
+
+
+# ---------------------------------------------------------------------------
+# Self-correction (added after Phase 10)
+# ---------------------------------------------------------------------------
+# When the validator or SQL Server rejects a query because of an honest
+# MISTAKE, the error is sent back to the model once, so it can fix its own SQL.
+#
+# SECURITY: rejections for dangerous SQL (DROP, EXEC, several statements ...)
+# are NEVER sent back for "correction". Otherwise a prompt-injection attack
+# could simply ask the model to keep trying until it slips past the validator.
+
+CORRECTABLE_VALIDATOR_RULES = {"wrong_dialect", "parse_error", "syntax",
+                               "table_not_allowed", "no_table"}
+
+
+def is_correctable(error_stage: str, validator_rule: str | None, error: str) -> bool:
+    if error_stage == "SQL validation":
+        return validator_rule in CORRECTABLE_VALIDATOR_RULES
+    if error_stage == "SQL execution":
+        # SQLSTATE 42xxx = syntax error, invalid column or table name.
+        # Timeouts and connection problems are not the model's fault.
+        return error.startswith("SQL error (42")
+    return False
+
+
+def correct_sql(question: str, previous: GenerationResult, error: str) -> GenerationResult:
+    """Second attempt: show the model its first answer and the error message."""
+    messages = [
+        {"role": "user", "content": build_user_message(question)},
+        {"role": "assistant", "content": previous.raw_output},
+        {"role": "user", "content": build_correction_message(error)},
+    ]
+    try:
+        reply = chat(messages, system=previous.system_prompt, response_format=SQL_RESPONSE_SCHEMA)
+    except OllamaError as exc:
+        raise SQLGenerationError(str(exc)) from exc
+
+    status, sql, message = parse_model_output(reply.content)
+    return GenerationResult(
+        status=status, sql=sql, message=message,
+        raw_output=reply.content, system_prompt=previous.system_prompt,
+        model=previous.model,
+        elapsed_seconds=reply.elapsed_seconds,
+        prompt_tokens=reply.prompt_tokens,
+        output_tokens=reply.output_tokens,
+        retrieval=previous.retrieval,
+    )

@@ -32,7 +32,8 @@ from database import DatabaseError, check_permissions, run_query, test_connectio
 from ollama_client import OllamaError
 from ollama_client import get_status as get_ollama_status
 from result_analyzer import check_numbers, explain, explain_stream, localise_currency
-from sql_generator import EXAMPLE_QUESTIONS, SQLGenerationError, generate_sql
+from sql_generator import (EXAMPLE_QUESTIONS, SQLGenerationError, correct_sql, generate_sql,
+                           is_correctable)
 from sql_validator import validate_sql
 from visualizer import bar_sort, suggest_chart
 
@@ -79,7 +80,7 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
     st.session_state.outcome_id = st.session_state.get("outcome_id", 0) + 1
     outcome = {"id": st.session_state.outcome_id,
                "asked": question, "question": question, "rewrite": None,
-               "sql": sql, "generation": None, "validation": None,
+               "sql": sql, "generation": None, "validation": None, "correction": None,
                "notice": None, "result": None, "error": None, "error_stage": None}
     st.session_state.outcome = outcome
 
@@ -112,7 +113,39 @@ def run_pipeline(question: str | None, sql: str | None = None) -> None:
     outcome["sql"] = generation.sql
 
     _check_and_run(outcome)
+
+    # Step 5: self-correction. An honest mistake (e.g. MySQL's LIMIT) gets ONE
+    # retry with the error message. Dangerous SQL never gets a second chance.
+    rule = (outcome["validation"] or {}).get("rule")
+    if (outcome["error"] and st.session_state.get("self_correct", True)
+            and is_correctable(outcome["error_stage"], rule, outcome["error"])):
+        _self_correct(outcome, generation)
+
     _remember(outcome, "ok" if outcome["error"] is None else "failed")
+
+
+def _self_correct(outcome: dict, generation) -> None:
+    correction = {"first_sql": outcome["sql"], "first_error": outcome["error"],
+                  "first_stage": outcome["error_stage"], "fixed": False,
+                  "seconds": 0.0, "note": ""}
+    outcome["correction"] = correction
+    try:
+        fix = correct_sql(outcome["question"], generation, outcome["error"])
+    except SQLGenerationError as exc:
+        correction["note"] = f"the retry failed ({exc})"
+        return
+    correction["seconds"] = fix.elapsed_seconds
+    if fix.status != "ok":
+        correction["note"] = f"the model answered '{fix.status}': {fix.message}"
+        return
+
+    # Run the corrected SQL through exactly the same checks as the first attempt.
+    outcome.update(sql=fix.sql, validation=None, result=None, error=None, error_stage=None)
+    outcome["generation"].update(raw_output=fix.raw_output, message=fix.message)
+    _check_and_run(outcome)
+    correction["fixed"] = outcome["error"] is None
+    if not correction["fixed"]:
+        correction["note"] = "the corrected SQL was rejected too"
 
 
 def _check_and_run(outcome: dict) -> None:
@@ -207,6 +240,9 @@ def render_sidebar(settings) -> None:
         st.caption(llm["message"])
         st.markdown(f"**Model:** `{llm['model']}`  \n"
                     "**Runs on:** this computer (no cloud, no API cost)")
+        st.toggle("🔧 Let the model fix rejected SQL", value=True, key="self_correct",
+                  help="One retry with the error message, for mistakes such as LIMIT. "
+                       "Dangerous SQL is never retried.")
         st.toggle("✍️ Explain results automatically", value=True, key="auto_explain",
                   help="Turn off to save time; you can still click 'Explain these results'.")
 
@@ -283,6 +319,7 @@ def render_outcome() -> None:
 
     # Generated SQL
     st.subheader("Generated SQL")
+    render_correction(outcome.get("correction"))
     if outcome["sql"]:
         st.code(outcome["sql"], language="sql")
         if generation and generation["message"]:
@@ -444,6 +481,22 @@ def show_explanation_notes(explanation: dict) -> None:
     if explanation.get("facts"):
         with st.expander("🔍 What the model was given to write this explanation"):
             st.code(explanation["facts"], language="text")
+
+
+def render_correction(correction: dict | None) -> None:
+    """Explain a self-correction, and show the rejected first attempt."""
+    if not correction:
+        return
+    if correction["fixed"]:
+        st.info(f"🔧 **Self-corrected.** The first SQL was rejected "
+                f"({correction['first_stage']}: {correction['first_error']}). "
+                f"The model fixed it in {correction['seconds']:.1f} s. The corrected SQL "
+                "passed the same checks.")
+    else:
+        st.caption(f"🔧 The model tried to fix its SQL, but {correction['note']}.")
+    with st.expander("First attempt (rejected)"):
+        st.code(correction["first_sql"], language="sql")
+        st.caption(correction["first_error"])
 
 
 def render_retrieval_caption(generation: dict | None) -> None:

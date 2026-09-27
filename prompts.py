@@ -239,3 +239,21 @@ NEW MESSAGE: What is the average employee salary?
 
 def build_rewrite_message(history_text: str, question: str) -> str:
     return f"Conversation:\n{history_text}\nNEW MESSAGE: {question}"
+
+
+
+# ---------------------------------------------------------------------------
+# Self-correction: feeding an error back to the model
+# ---------------------------------------------------------------------------
+# The conversation becomes: question -> model's first answer -> this message.
+# The model sees its own mistake AND the exact error, which is usually enough
+# for it to fix things like LIMIT -> TOP or a misspelled column.
+
+def build_correction_message(error: str) -> str:
+    return (
+        "Your SQL could not be used. The error was:\n"
+        f"{error}\n\n"
+        "Write a corrected query for Microsoft SQL Server (T-SQL) that answers the same "
+        "question. Use only the tables and columns in the schema. Reply with the same "
+        "JSON format."
+    )
