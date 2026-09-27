@@ -1,0 +1,13 @@
+# Phase 2 - Python <-> SQL Server
+pandas>=2.2
+pyodbc>=5.1
+python-dotenv>=1.0
+
+# Phase 3 - web interface
+streamlit>=1.50
+
+# Phase 4 - talking to the local Ollama server
+requests>=2.31
+
+# Phase 6 - SQL parser used by the validator
+sqlglot>=26.0

@@ -1,0 +1,10 @@
+# Secrets - never commit real credentials
+.env
+
+# Python virtual environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Logs
+*.log

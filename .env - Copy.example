@@ -1,0 +1,61 @@
+# =====================================================================
+# GenAI SQL Assistant - configuration template
+#
+# 1. Copy this file and name the copy ".env"   (copy .env.example .env)
+# 2. Put your real values in .env
+# 3. NEVER commit .env to Git (it is listed in .gitignore)
+# =====================================================================
+
+# --- SQL Server connection -------------------------------------------
+DB_SERVER=localhost
+DB_DATABASE=GenAI_Demo_DB
+
+# "sql"     = username + password (recommended: the read-only genai_reader)
+# "windows" = your Windows login (quick start, but NOT read-only)
+DB_AUTH_MODE=sql
+DB_USERNAME=genai_reader
+DB_PASSWORD=
+
+# Check installed drivers with:  python -c "import pyodbc; print(pyodbc.drivers())"
+DB_DRIVER=ODBC Driver 18 for SQL Server
+
+# "yes" for a local dev server with a self-signed certificate.
+# Use "no" with a properly certified server in production.
+DB_TRUST_SERVER_CERTIFICATE=yes
+
+# --- Safety limits ----------------------------------------------------
+DB_LOGIN_TIMEOUT=5        # seconds to wait when connecting
+DB_QUERY_TIMEOUT=30       # seconds before a running query is cancelled
+MAX_RESULT_ROWS=1000      # maximum rows returned to the app
+
+# --- Local LLM (Ollama) - Phase 4 --------------------------------------
+# Ollama must run on THIS computer (localhost). No cloud, no API key, no cost.
+OLLAMA_URL=http://localhost:11434
+
+# Pick by hardware (see the Phase 4 notes):
+#   8 GB RAM, no GPU      -> qwen2.5-coder:3b   (1.9 GB download)
+#   16 GB+ RAM or a GPU   -> qwen2.5-coder:7b   (4.7 GB download)
+OLLAMA_MODEL=qwen2.5-coder:3b
+
+# Optional: a different (e.g. larger) model just for understanding follow-up
+# questions. Leave empty to use OLLAMA_MODEL. Example: qwen2.5-coder:7b
+OLLAMA_REWRITE_MODEL=
+
+OLLAMA_TIMEOUT=180         # seconds; the first answer is slow while the model loads
+OLLAMA_TEMPERATURE=0       # 0 = predictable output, which is what SQL needs
+OLLAMA_CONTEXT_SIZE=4096   # tokens of prompt + answer the model can handle
+
+# --- Display - Phase 7 ----------------------------------------------------
+# Currency used by the AI explanation for money amounts (the data itself
+# stores plain numbers without a currency).
+CURRENCY_SYMBOL=Rs.
+CURRENCY_NAME=Pakistani Rupees
+
+# --- Schema retrieval (RAG) - Phase 9 --------------------------------------
+# auto   = send only relevant tables when the full schema is large (default)
+# always = always retrieve (to demonstrate / test RAG on our small database)
+# never  = always send the full schema
+SCHEMA_RETRIEVAL=auto
+EMBEDDING_MODEL=nomic-embed-text     # download with: ollama pull nomic-embed-text
+RETRIEVAL_TOP_K=4                    # most relevant tables (JOIN tables are added)
+RETRIEVAL_AUTO_THRESHOLD_TOKENS=1500 # "auto" retrieves above this schema size
